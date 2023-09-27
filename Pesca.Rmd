@@ -1,11 +1,37 @@
+---
+title: "Matura-Comprimento Logistic Regression Analysis"
+author: "Javier Martinez-Arribas (javimartinezarribas@gmail.com)"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output: html_document
+---
 
+No estudo seguinte tentaremos descobrir a relação entre a matura do peixe e um conjunto 
+diferente de variáveis explicativas como o comprimento, o sexo ou o trimestre em que
+a amostra foi recolhida.
+Tentaremos conhecer esta relação através de um tipos de modelo, tal como:
+
+- Modelo de Regressão Logistica
+
+Nosso primeiro passo será carregar as bibliotecas que vamos usar:
+
+```{r, echo=T, message=F, warning=F, error=F}
 library(tidyverse)
 library(lubridate)
+library(readxl)
 library(stringr)
-library(DBI)
+library(varhandle)
+library(pROC)
+library(ROCR)
+library(sjPlot)
+library(rmarkdown)
 library(FSA)
+library(VIM)
 
-#Dados (.Renviron)
+```
+
+e carregar os dados...
+
+```{r, echo=T, message=F, warning=F, error=F}
 dbicon <-  DBI::dbConnect(RPostgres::Postgres(),
                           db = Sys.getenv('POSTGRES_DB'),
                           host = Sys.getenv('POSTGRES_HOST'),
@@ -18,23 +44,35 @@ df_maturity <- DBI::dbGetQuery(dbicon, sql)
 
 
 DBI::dbDisconnect(dbicon)
+```
 
+```{r, echo=T, message=F, warning=F, error=F}
+#file <- "../../../DATA/output/pesca_data.csv"
+#df_maturity <- read.csv(file, header=TRUE, sep=',')
+```
 
-#nós selecionamos, filtramos e processamos os preditores que vamos utilizar na análise:
+Em seguida, selecionamos os preditores que vamos utilizar na análise:
+
+```{r, echo=T, message=F, warning=F, error=F}
 maturity_tbl <- df_maturity %>%
-  select(Data, Ano, Mes, Trimestre, Matura, Sexo, MaturaH1, SexoH1, Total_length, Especie,Peso_total) %>%
+  select(Data, Ano, Mes, Trimestre, Matura, Sexo, MaturaH1, SexoH1, Total_lenght,  Especie,Peso_total) %>%
   set_names(c("date", "ano", "mes", "trimestre", "matura", "sexo", "maturaH1",
               "sexoH1", "comprimento", "specie", "peso")) 
+```
 
-#NAs
+Eliminamos os registros que possuem valores NA em alguma de suas colunas:
+
+```{r, echo=T, message=F, warning=F, error=F}
 maturity_tbl <- maturity_tbl[complete.cases(maturity_tbl),]
+
 colSums(is.na(maturity_tbl))
+```
 
-
+```{r, echo=T, message=F, warning=F, error=F}
 maturity_tbl <- maturity_tbl %>% mutate(sexo = ifelse(sexoH1 %in% "", sexo, sexoH1))
 maturity_tbl <- maturity_tbl %>% mutate(matura = ifelse(maturaH1 %in% "", 
-                                                        substr(matura,start=1,stop=1), 
-                                                        maturaH1))
+                                                       substr(matura,start=1,stop=1), 
+                                                       maturaH1))
 maturity_tbl$day <- gsub("(.*)[-]", "", maturity_tbl$date)
 
 maturity_tbl <- maturity_tbl %>%
@@ -42,28 +80,39 @@ maturity_tbl <- maturity_tbl %>%
 
 # Alterar alguns formatos
 maturity_tbl <- maturity_tbl %>% 
-  mutate(matura = as.factor(matura),
-         specie = as.factor(trimws(specie)))
+                    mutate(matura = as.factor(matura),
+                           specie = as.factor(trimws(specie)))
 
 
+```
 
-# 'IND', 'H' e ''
+Filtramos as observações com valores da variável sexo ('IND', 'H' e '') e 
+observações com matura vazia o 'I', uma vez que serão mais difíceis de 
+imputar.
+
+```{r, echo=T, message=F, warning=F, error=F}
 print("Frequência de sexo=('', 'IND' ou 'H') em os tipos de matura")
+
+# Para quais valores de matura temos sexo igual a ('', 'IND' ou 'H')
 with(maturity_tbl[maturity_tbl$sexo %in% c('','IND','H'),], table(matura))
 
+# E nós os filtramos
 maturity_tbl <- maturity_tbl %>% 
-  filter(!sexo %in% c('IND','H',''))
+                  filter(!sexo %in% c('IND','H',''))
 
-# matura=('I','',' ')
+# nós os filtramos matura=('I','',' ')
 maturity_tbl <- maturity_tbl %>% 
-  filter(!matura %in% c('I','',' '))
+                  filter(!matura %in% c('I','',' '))
 
+# Descartamos os níveis que não são adequados no conjunto de dados:
 maturity_tbl$matura <- droplevels(maturity_tbl$matura)
 print("Removemos os níveis matura = (' ','I'). Obs frequência com comprimento = 0") 
 with(maturity_tbl[maturity_tbl$comprimento==0,], table(matura))
+```
 
+Nós criamos o preditor de intervalo e selecionamos as observações para a espécie GOR.
 
-#lcat2
+```{r, echo=T, message=F, warning=F, error=F}
 maturity_tbl <- maturity_tbl %>% mutate(lcat2=lencat(comprimento,w=2))
 
 #Filtramos as observações de la especie "GOR" e a variável "specie"
@@ -71,10 +120,21 @@ maturity_tbl <- maturity_tbl %>% filter(specie=='GORAZ') %>% select(-specie)
 
 #Filtramos as observações en anos irracional
 maturity_tbl <- maturity_tbl %>% filter(ano>1900)
+```
 
-# o comprimento = 0, convertê-los para NA
+
+### Imputing comprimento=0 e formatação de variáveis categóricas
+
+
+```{r, echo=T, fig.width=10,fig.height=5}
+# induce some missing data at comprimento=0
+# Para imputar o comprimento = 0, tenho que convertê-los para NA
 maturity_tbl$comprimento[maturity_tbl$comprimento==0] <- NA
+```
 
+
+
+```{r, echo=T, fig.width=10,fig.height=5}
 # Construímos a variável dicotômica madura que agrupa peixes com maturidade 0,2 
 # como imaturos e 1,3,4,5 como maduros.
 maturity_tbl$mature <- NA
@@ -85,15 +145,20 @@ maturity_tbl$mature <- factor(maturity_tbl$mature)
 maturity_tbl[maturity_tbl$sexo %in% c("M"),'sexo'] <- 1
 maturity_tbl[maturity_tbl$sexo %in% c("F"),'sexo'] <- 0
 maturity_tbl$sexo <- factor(maturity_tbl$sexo)
+```
+
 
 
 ## Análise exploratória de dados
 
+Primeiramente vamos tentar conhecer um pouco melhor as distribuições de nossas 
+variáveis através dos gráficos a seguir.
 
 #### Distribuição de comprimentos entre maduros e imaturos:
 
-
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 # comprimento by sexo distribution
+
 cols <- c("0" = "red", "1" = "blue")
 ggplot(data=na.omit(maturity_tbl), aes(x=comprimento,fill= mature)) +
   geom_histogram(position="identity",alpha=0.5)+
@@ -102,12 +167,15 @@ ggplot(data=na.omit(maturity_tbl), aes(x=comprimento,fill= mature)) +
   theme(legend.position="top") +
   ggtitle("Distribuição do comprimento em espécie de Goraz") +
   theme(plot.title = element_text(hjust = 0.5))
+```
+  
 
-ggsave("comprimento_sexo.png")
-
+Há uma alta sobreposição das distribuições de peixes maduros e imaturos, o que 
+dificultará sua discriminação.
 
 #### Distribuição do comprimento entre maduros e imaturos e entre os sexos:
-
+  
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 # comprimento by sexo distribution
 cols <- c("0" = "red", "1" = "blue")
 sex_names <- c(
@@ -123,13 +191,14 @@ ggplot(data=na.omit(maturity_tbl), aes(x=comprimento,  fill= mature)) +
   theme(legend.position="top") +
   ggtitle("Distribuição do comprimento por sexo em espécie de Goraz") +
   theme(plot.title = element_text(hjust = 0.5))
+```
 
-ggsave("comprimento_matura_sexo.png")
-
-
+Embora talvez alguma melhora possa ser vista quando se trata de 
+discriminar, especialmente melhorando nas fêmeas.
 
 #### Box-plot comprimento por sexo:
-
+  
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 cols <- c("0" = "red", "1" = "blue")
 
 ggplot(maturity_tbl, aes(x=sexo, y=comprimento, color=sexo)) +
@@ -140,12 +209,14 @@ ggplot(maturity_tbl, aes(x=sexo, y=comprimento, color=sexo)) +
   xlab("Sexo") + ylab("Comprimento") + labs(color = "Sexo") +
   theme(plot.title = element_text(hjust = 0.5))
 
-ggsave("bp_comprimento_sexo.png")
+```
 
+É provável que existam diferentes comprimentos médios entre machos e fêmeas.
 
 
 #### Distribuição do comprimento por sexo e matura:
 
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 ggplot(na.omit(maturity_tbl), aes(x=mature, y=comprimento, color=sexo)) +
   geom_boxplot() +
   scale_color_manual(values = cols, breaks = c("0", "1"),labels = c("Female", "Male")) +
@@ -153,25 +224,25 @@ ggplot(na.omit(maturity_tbl), aes(x=mature, y=comprimento, color=sexo)) +
   xlab("Matura") + ylab("Comprimento") + labs(color = "Sexo") +
   ggtitle("Length by sex and matura in GOR specie") +
   theme(plot.title = element_text(hjust = 0.5))
-
-ggsave("bp_comprimento_matura_sexo.png")
+```
 
 
 #### Comprimento ao longo dos anos por sexo:
-
+  
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 ggplot(na.omit(maturity_tbl), aes(x=ano, y=comprimento, col=sexo)) +
   geom_point() +
   scale_color_manual(values = cols, breaks = c("0", "1"),labels = c("Female", "Male")) +
   ggtitle("Comprimento por ano e sexo em espécie Goraz") +
   xlab("Ano") + ylab("Comprimento") + labs(color = "Sexo") +
   theme(plot.title = element_text(hjust = 0.5))
-
-ggsave("ts_comprimento_ano_sexo.png")
+```
 
 
 
 #### Heterogeneidade ao longo do tempo por sexo:
-
+  
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 #Heterogeneity along the time
 maturity_tbl %>%
   group_by(ano,sexo) %>%
@@ -188,54 +259,83 @@ maturity_tbl %>%
   theme(axis.text.x = element_text(angle = 90)) +
   ggtitle("Comprimento médio ao longo dos trimestres para a espécie de Goraz") +
   theme(plot.title = element_text(hjust = 0.5))
+```
 
-ggsave("ts_comprimento_ano_sexo_bis.png")
 
 ## Modeling
 
-
+Em seguida, vamos estudar 3 modelos diferentes de regressão logística:
   
+A matura em relação ao comprimento:
+
+***matura ~ comprimento***
+
+A matura em relação ao comprimento, sexo e a interação entre esses:
+
+***matura ~ comprimento + sexo1 + comprimento:sexo1***
+
+A matura em relação ao comprimento, sexo, trimestre e a interação entre esses:
+
+***matura ~ comprimento + sexo1 + ano + comprimento:sexo1 + comprimento:trimestre + sexo1:trimestre + comprimento:sexo1:trimestre***
+
+
 ### Primeiro modelo
 
 #### A matura em relação ao comprimento
+
+```{r, echo=T, message=F, warning=F, error=F}
 mylogit1 <- glm(mature ~ comprimento, data = maturity_tbl, family = "binomial")
-test <- summary(mylogit1)
+summary(mylogit1)
+```
+A variável de comprimento parece significativa no ajuste do modelo.
 
+Intervalos de confiança para parâmetros do modelo por meio de reamostragem (logs):
 
-# Guarda el resumen como un archivo TXT
-sink("mylogit1.txt")
-print(summary(mylogit1))
-sink()
-
-
-#Intervalos de confiança para parâmetros do modelo por meio de reamostragem
+```{r, echo=T, message=F, warning=F, error=F}
 bcL1 <- car::Boot(mylogit1,R=100)
 confint(bcL1)
+```
 
 
-#Intervalos de confiança baseados na distribuição normal (odds)
+Intervalos de confiança baseados na distribuição normal (odds):
+
+```{r, echo=T, message=F, warning=F, error=F}
 ## odds ratios and 95% CI
 print("odds ratios and 95% CI for males")
 exp(cbind(OddsRatio = coef(mylogit1), confint(mylogit1)))
+```
+Para cada centímetro adicional de compressão, a probabilidade do peixe estar maduro 
+aumenta 1% de acordo com na extremidade esquerda do intervalo e casi um 3% na extremidade 
+direita.
 
-#Intervalos de confiança para a probabilidade prevista de maturação dos peixes 
-#de 30cm:
+Intervalos de confiança para a probabilidade prevista de maturação dos peixes de 30cm:
+
+```{r, echo=T, message=F, warning=F, error=F, fig.width=10,fig.height=5}
 cf <- coef(mylogit1)
 bcL <- car::bootCase(mylogit1, B=100)
 predP <- function(cf,x) exp(cf[1]+cf[2]*x)/(1+exp(cf[1]+cf[2]*x))
 p30 <- apply(bcL,1,predP,x=30)
 quantile(p30,c(0.025,0.975))
+```
+
+Um peixe de comprimento de 30 cm terá uma probabilidade de estar maduro entre 53% e 58%
+com 95% de confiança.
 
 
+O limite de decisão ideal e o tamanho do comprimento no qual esse limite é alcançado é:
 
+```{r, echo=T, fig.width=10,fig.height=5}
 p <- 0.5
 b1 <- unname(cf[1])
 b2 <- unname(cf[2])
 y <- log(p/(1-p))
 print(paste("Comprimento para 50% de prob de ser matura em machos:",(round(((y - b1)/b2),3))))
+```
 
+A representação do limite de decisão na função sigmoide:
 
-# Classificador de regressão logística para machos
+```{r, echo=T, fig.width=10,fig.height=5}
+# Logistic regression classifier for males
 x <- seq(-170,170,0.1)
 p <- exp(cf[1]+cf[2]*x)/(1+exp(cf[1]+cf[2]*x))
 plot(p ~ x, col = "orange", pch = "|", ylim = c(0, 1),cex=0.25,
@@ -245,73 +345,101 @@ abline(h = 1, lty = 3)
 abline(h = 0.5, lty = 2) 
 abline(v = -b1 / b2, lwd = 2)
 abline(v =  (y - b1)/b2, lwd= 2, col = "green")
+```
 
+Para o caso subótimo do limiar de decisão que obtém 50% de probabilidade do 
+indivíduo ser maduro é:
 
+```{r, echo=T, fig.width=10,fig.height=5}
 print(paste("Comprimento para 50% prob de ser matura em machos:", round((-b1/b2),3)))
-
+```
 
 
 ### Segundo modelo:
 
 #### A matura em relação ao intervalo de comprimento, sexo e a interação entre esses
 
+
+```{r, echo=T, fig.width=10,fig.height=5}
 mylogit2 <- glm(mature ~ comprimento*sexo, data = maturity_tbl, family = "binomial")
 summary(mylogit2)
+```
 
-sink("mylogit2.txt")
-print(summary(mylogit2))
-sink()
-
-# Seleção de preditores
+```{r, echo=T, fig.width=10,fig.height=5}
 drop1(mylogit2,~.,test="Chisq")
+```
 
-# Intervalos de confiança
+Vemos com a função drop1 que a inclusão de as variáveis, comprimento
+e comprimento:sexo melhora o ajuste do modelo. Sexo não.
+
+
+```{r, echo=T, fig.width=10,fig.height=5}
 bcL2 <- car::Boot(mylogit2,R=100)
 confint(bcL2)
+```
 
+Apreciamos nos intervalos de confiança para o parâmetro de sexo que a probabilidade de ser 
+maduro diminuiu nos machos.
+
+
+```{r, echo=T, fig.width=10,fig.height=5}
 cf <- coef(mylogit2)
 x <- seq(-170,170,0.1)
 #females
 pfem <- exp(cf[1]+cf[2]*x)/(1+exp(cf[1]+cf[2]*x))
 #males
 pmas <- exp(cf[1]+cf[3]+(cf[2]+cf[4])*x)/(1+exp(cf[1]+cf[3]+(cf[2]+cf[4])*x))
+```
 
 
+```{r, echo=T, fig.width=10,fig.height=5}
 plot(pfem ~ x,type="l",lwd=2,xlab="Comprimento",ylab="Proportion Mature", col = "red") + 
-  lines(pmas ~ x,type="l",lwd=2,col="blue") 
+lines(pmas ~ x,type="l",lwd=2,col="blue") 
 legend("bottomright",c("Female","Male"),lwd=2,col=c("red","blue"),bty="n")
 abline(h = 0, lty = 3)
 abline(h = 1, lty = 3)
 abline(h = 0.5, lty = 2)
 abline(v = - cf[1] / cf[2], lwd = 2, col = "red")
 abline(v = - (cf[1]+cf[3]) / (cf[2]+cf[4]), lwd = 2, col="blue")
+```
+El tamaño de maduración es mucho mayor en las hembras que en los machos.
 
 
+```{r, echo=F, fig.width=10,fig.height=5}
 print(paste("Comprimento para 50% prob de ser matura en females:", round(- cf[1] / cf[2],3)))
 
 print(paste("Comprimento para 50% prob de ser matura en males:", round((- (cf[1]+cf[3]) / (cf[2]+cf[4])),3)))
-
+```
 
 ### Terceiro modelo:
 
 #### A matura em relação ao intervalo de comprimento, sexo, ano e a interação entre esses.
 
 
-
+```{r, echo=T, fig.width=10,fig.height=5}
 mylogit3 <- glm(mature ~ comprimento*sexo*trimestre,
                 data = maturity_tbl, family = "binomial")
 summary(mylogit3)
+```
 
-# Convert summary to TXT
-sink("mylogit3.txt")
-print(summary(mylogit3))
-sink()
-
-# Seleção de preditores
+```{r, echo=T, fig.width=10,fig.height=5}
 drop1(mylogit3,~.,test="Chisq")
+```
+Podemos ver pelos resultados que a inclusão da variável trimestral melhora 
+significativamente o modelo. 
 
+Se olharmos para o critério de informação de Akaike,vemos também este último modelo 
+adquire um valor inferior.
+
+```{r, echo=T}
 AIC(mylogit1,mylogit2,mylogit3)
+```
 
+Por fim, vamos ver o formato das curvas ROC para termos uma ideia de quão bom é 
+cada um dos modelos.
+
+
+```{r, echo=T, fig.width=10,fig.height=5}
 # Compute predicted probabilities
 df <- maturity_tbl %>% na.omit()
 
@@ -339,3 +467,4 @@ legend(x = "bottom",inset = 0,
        legend = c("Model1", "Model2", "Model3"), 
        col=plot_colors, lwd=7, cex=.7, horiz = TRUE)
 
+```
